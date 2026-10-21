@@ -13,6 +13,8 @@
 //    would have put them and release the click for them.
 //
 // Either way the new spot must be clear of hazards for a few ticks ahead.
+// Moving hazards are tracked tick by tick while the buffer is on, so that
+// check uses where each one will be, not just where it is now.
 //
 // F6 (in a level) cycles: OFF -> 2 -> 4 -> 8 -> 16 ticks (wave capped at 8) -> OFF.
 // It starts OFF every session. While it's on, an on-screen label always shows
@@ -28,6 +30,7 @@
 #include <cctype>
 #include <cmath>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace geode::prelude;
@@ -45,6 +48,10 @@ namespace {
 	constexpr double kMaxShift = 90.0;
 	// Velocity changes bigger than this between ticks are portals/teleports, not gravity.
 	constexpr double kMaxAccel = 3.0;
+	// Objects that jump further than this in one tick were teleported, not moved.
+	constexpr float kMaxObjectSpeed = 40.f;
+	// How often (in ticks) the list of objects near the player is rebuilt.
+	constexpr long long kWatchRefresh = 10;
 
 	int g_stage = 0;
 	long long g_step = 0;
@@ -81,6 +88,22 @@ namespace {
 	ShipAccel g_shipAccel[2];
 
 	OBB2D* g_playerBox = nullptr;
+
+	// Moving-object tracking: where each nearby hazard/block was last tick and how fast it's moving.
+	struct ObjectTrack {
+		CCPoint pos;
+		CCPoint vel;
+		long long step = -1;
+	};
+	std::unordered_map<GameObject*, ObjectTrack> g_tracks;
+	std::vector<GameObject*> g_watch;
+	long long g_watchBuiltStep = -1;
+
+	void clearTracks() {
+		g_tracks.clear();
+		g_watch.clear();
+		g_watchBuiltStep = -1;
+	}
 
 	bool enabled() {
 		return Mod::get()->getSettingValue<bool>("input-buffer");
@@ -236,29 +259,107 @@ namespace {
 		return inner.intersectsRect(obj->getObjectRect());
 	}
 
+	// 0 = not something that can kill or block, 1 = hazard, 2 = solid.
+	int obstacleKind(PlayLayer* layer, GameObject* obj) {
+		if (!obj) return 0;
+		auto type = obj->m_objectType;
+		bool hazard = type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard;
+		bool solid = type == GameObjectType::Solid;
+		if (!hazard && !solid) return 0;
+		if (obj->m_isGroupDisabled || obj->m_isNoTouch || obj->m_isPassable) return 0;
+		if (obj == layer->m_anticheatSpike) return 0;
+		return hazard ? 1 : 2;
+	}
+
+	// Rebuild the list of obstacles near either player. Done every few ticks,
+	// since scanning the whole level every tick would be too slow.
+	void rebuildWatch(PlayLayer* layer) {
+		g_watch.clear();
+		g_watchBuiltStep = g_step;
+
+		std::vector<CCRect> areas;
+		for (auto player : {layer->m_player1, layer->m_player2}) {
+			if (!player) continue;
+			auto pos = player->m_position;
+			areas.emplace_back(pos.x - 250.f, pos.y - 450.f, 900.f, 900.f);
+		}
+		if (areas.empty()) return;
+
+		for (auto obj : CCArrayExt<GameObject*>(layer->m_objects)) {
+			if (!obstacleKind(layer, obj)) continue;
+			auto pos = obj->getPosition();
+			for (auto const& area : areas) {
+				if (area.containsPoint(pos)) {
+					g_watch.push_back(obj);
+					break;
+				}
+			}
+		}
+
+		// Forget objects that are no longer nearby.
+		for (auto it = g_tracks.begin(); it != g_tracks.end();) {
+			if (it->second.step < g_step - kWatchRefresh * 2) it = g_tracks.erase(it);
+			else ++it;
+		}
+	}
+
+	// Record where each nearby obstacle is this tick and how far it moved since last tick.
+	void updateTracks(PlayLayer* layer) {
+		if (!active()) {
+			if (!g_tracks.empty() || !g_watch.empty()) clearTracks();
+			return;
+		}
+		if (g_watchBuiltStep < 0 || g_step - g_watchBuiltStep >= kWatchRefresh) {
+			rebuildWatch(layer);
+		}
+		for (auto obj : g_watch) {
+			auto const& rect = obj->getObjectRect();
+			CCPoint center{rect.getMidX(), rect.getMidY()};
+			auto& track = g_tracks[obj];
+			if (track.step == g_step - 1) {
+				CCPoint vel = center - track.pos;
+				bool teleported = std::abs(vel.x) > kMaxObjectSpeed || std::abs(vel.y) > kMaxObjectSpeed;
+				track.vel = teleported ? CCPoint{0.f, 0.f} : vel;
+			} else {
+				track.vel = {0.f, 0.f};
+			}
+			track.pos = center;
+			track.step = g_step;
+		}
+	}
+
+	CCPoint velocityOf(GameObject* obj) {
+		auto it = g_tracks.find(obj);
+		if (it == g_tracks.end() || it->second.step < g_step - 1) return {0.f, 0.f};
+		return it->second.vel;
+	}
+
+	struct MovingObstacle {
+		GameObject* obj;
+		CCPoint vel;
+	};
+
 	struct Obstacles {
-		std::vector<GameObject*> hazards;
+		std::vector<MovingObstacle> hazards;
 		std::vector<GameObject*> solids;
 	};
 
 	Obstacles gatherObstacles(PlayLayer* layer, CCRect const& base, float reachX, float reachY) {
 		Obstacles out;
-		float minX = base.getMinX() - 150.f;
-		float maxX = base.getMaxX() + reachX + 150.f;
-		float minY = base.getMinY() - reachY - 150.f;
-		float maxY = base.getMaxY() + reachY + 150.f;
+		// Extra margin so hazards that will move into the path are included.
+		float margin = 150.f + kMaxObjectSpeed * kLookahead;
+		float minX = base.getMinX() - margin;
+		float maxX = base.getMaxX() + reachX + margin;
+		float minY = base.getMinY() - reachY - margin;
+		float maxY = base.getMaxY() + reachY + margin;
 
 		for (auto obj : CCArrayExt<GameObject*>(layer->m_objects)) {
-			if (!obj) continue;
-			auto type = obj->m_objectType;
-			bool hazard = type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard;
-			bool solid = type == GameObjectType::Solid;
-			if (!hazard && !solid) continue;
-			if (obj->m_isGroupDisabled || obj->m_isNoTouch || obj->m_isPassable) continue;
-			if (obj == layer->m_anticheatSpike) continue;
+			int kind = obstacleKind(layer, obj);
+			if (!kind) continue;
 			auto pos = obj->getPosition();
 			if (pos.x < minX || pos.x > maxX || pos.y < minY || pos.y > maxY) continue;
-			(hazard ? out.hazards : out.solids).push_back(obj);
+			if (kind == 1) out.hazards.push_back({obj, velocityOf(obj)});
+			else out.solids.push_back(obj);
 		}
 		return out;
 	}
@@ -273,8 +374,12 @@ namespace {
 			CCRect r = base;
 			r.origin.x += static_cast<float>(j * dx);
 			r.origin.y += static_cast<float>(shift + j * dy + 0.5 * j * (j + 1) * accel);
-			for (auto obj : obs.hazards) {
-				if (hitsHazard(r, obj)) return false;
+			for (auto const& hazard : obs.hazards) {
+				// Instead of moving the hazard j ticks forward, move the player the opposite way.
+				CCRect relative = r;
+				relative.origin.x -= hazard.vel.x * j;
+				relative.origin.y -= hazard.vel.y * j;
+				if (hitsHazard(relative, hazard.obj)) return false;
 			}
 		}
 		return true;
@@ -439,6 +544,7 @@ namespace {
 
 class $modify(BufferPlayLayer, PlayLayer) {
 	bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+		clearTracks();
 		if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
 			return false;
 		}
@@ -450,7 +556,13 @@ class $modify(BufferPlayLayer, PlayLayer) {
 	void resetLevel() {
 		PlayLayer::resetLevel();
 		resetStates();
+		clearTracks();
 		updateIndicator(this);
+	}
+
+	void onQuit() {
+		clearTracks();
+		PlayLayer::onQuit();
 	}
 
 	void destroyPlayer(PlayerObject* player, GameObject* object) {
@@ -464,11 +576,13 @@ class $modify(BufferPlayLayer, PlayLayer) {
 class $modify(BufferGameLayer, GJBaseGameLayer) {
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
 		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-		if (!typeinfo_cast<PlayLayer*>(this)) {
+		auto playLayer = typeinfo_cast<PlayLayer*>(this);
+		if (!playLayer) {
 			return;
 		}
 		trackMovement(m_player1, g_states[0]);
 		trackMovement(m_player2, g_states[1]);
+		updateTracks(playLayer);
 		++g_step;
 	}
 };

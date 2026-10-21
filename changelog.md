@@ -1,3 +1,6 @@
+# v1.4.0
+- Moving hazards: while the buffer is on, nearby spikes, saws and blocks are tracked every tick, so a fix won't put you where a moving hazard is about to be (or skip a spot one is about to leave).
+
 # v1.3.0
 - Early release: on wave and ship, if holding would crash you and letting go a few ticks earlier wouldn't have, the click is released for you. Ship learns its physics from your play, so it starts working after you've let go in a ship once that session (normal and mini are learned separately).
 
