@@ -1,0 +1,25 @@
+{
+	"geode": "5.11.2",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081",
+		"ios": "2.2081"
+	},
+	"id": "trenmaxxrr.hacks",
+	"name": "Trenmaxxrr Hacks",
+	"version": "v1.0.0",
+	"developer": "Trenmaxxrr",
+	"description": "Custom hacks, each one toggleable in this mod's settings.",
+	"dependencies": {
+		"geode.node-ids": ">=v1.23.3"
+	},
+	"settings": {
+		"show-menu-button": {
+			"type": "bool",
+			"name": "Show menu button",
+			"description": "Adds a button to the main menu that confirms the mod is loaded.",
+			"default": true
+		}
+	}
+}
