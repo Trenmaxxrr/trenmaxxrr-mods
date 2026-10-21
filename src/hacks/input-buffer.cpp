@@ -321,7 +321,7 @@ namespace {
 				bool teleported = std::abs(vel.x) > kMaxObjectSpeed || std::abs(vel.y) > kMaxObjectSpeed;
 				track.vel = teleported ? CCPoint{0.f, 0.f} : vel;
 			} else {
-				track.vel = {0.f, 0.f};
+				track.vel = CCPoint{0.f, 0.f};
 			}
 			track.pos = center;
 			track.step = g_step;
