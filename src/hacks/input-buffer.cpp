@@ -1,20 +1,23 @@
-// Input buffer ("trajectory fix"), all gamemodes.
+// Input buffer: shifts the timing of your clicks/releases (never your player)
+// so you don't crash, by up to the current stage's tick count.
 //
-// When a player is about to die, try two fixes, in order:
+// Predictions use a hidden copy of the player run through GD's own physics and
+// collision code (the same method trajectory mods use). While simulating, the
+// hidden player only collides with blocks, slopes and hazards; anything that
+// would set off orbs, pads, portals, triggers or effects is blocked.
 //
-// 1. Shift the last click/release. If the death comes shortly after an input,
-//    estimate where they'd be if that input had happened a few ticks earlier
-//    or later. Shifting an input by k ticks moves the player by about
-//    k * (current y-velocity - the y-velocity they'd have without the input).
-//    Exact for the wave; a close first-order guess for gravity modes.
-//
-// 2. Early release. If they're holding (wave or ship) and would have survived
-//    by letting go up to a few ticks ago, move them to where that release
-//    would have put them and release the click for them.
-//
-// Either way the new spot must be clear of hazards for a few ticks ahead.
-// Moving hazards are tracked tick by tick while the buffer is on, so that
-// check uses where each one will be, not just where it is now.
+// What it does:
+// - Hold back: when you click/release and doing it now would crash you soon,
+//   but doing it up to N ticks later wouldn't, the input is delayed.
+// - Switch early (wave and ship only): when you're about to crash within N
+//   ticks and switching now would save you, it switches now and waits up to
+//   N ticks for your real input. If yours doesn't come, it switches back.
+//   One-shot modes (cube jump, ball/UFO/spider/swing) don't get this, since
+//   a jump can't be taken back; that would be the mod playing for you.
+// - If the hidden player touches an orb, pad or portal, the prediction isn't
+//   trustworthy, so your input goes through untouched.
+// - Moving hazards are tracked tick by tick, so predictions use where they'll
+//   be, not where they are now.
 //
 // F6 (in a level) cycles: OFF -> 2 -> 4 -> 8 -> 16 ticks (wave capped at 8) -> OFF.
 // It starts OFF every session. While it's on, an on-screen label always shows
@@ -25,6 +28,9 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
+#include <Geode/modify/HardStreak.hpp>
+#include <Geode/modify/EffectGameObject.hpp>
+#include <Geode/modify/GameObject.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -40,14 +46,10 @@ namespace {
 	constexpr int kStageTicksAll[] = {0, 2, 4, 8, 16};
 	constexpr int kStageTicksWave[] = {0, 2, 4, 8, 8};
 	constexpr int kStageCount = 5;
-	// A death counts as "caused by the last input" if it happens within this many ticks of it.
-	constexpr long long kDeathWindow = 48;
-	// After moving the player, the new path is checked this many ticks ahead for hazards.
-	constexpr int kLookahead = 8;
-	// Never move the player further than this (about 3 blocks).
-	constexpr double kMaxShift = 90.0;
-	// Velocity changes bigger than this between ticks are portals/teleports, not gravity.
-	constexpr double kMaxAccel = 3.0;
+	// How far ahead (ticks) a prediction runs.
+	constexpr int kHorizon = 48;
+	// A crash within (stage ticks + this) counts as "this input's fault".
+	constexpr int kDangerExtra = 6;
 	// Objects that jump further than this in one tick were teleported, not moved.
 	constexpr float kMaxObjectSpeed = 40.f;
 	// How often (in ticks) the list of objects near the player is rebuilt.
@@ -55,41 +57,32 @@ namespace {
 
 	int g_stage = 0;
 	long long g_step = 0;
-	// Set while the mod releases a click itself, so that release isn't treated as the player's.
-	bool g_virtualRelease = false;
 
-	struct PlayerState {
-		bool hasPrev = false;
-		CCPoint prev;
-		double lastDx = 0;
-		double lastDy = 0;
-		double prevDy = 0;
-		long long lastMoveStep = -1;
-		long long prevMoveStep = -1;
-		long long inputStep = -1;
-		double dyBeforeInput = 0;
-		double accelBeforeInput = 0;
-		bool correctedThisInput = false;
-		long long correctedStep = -1;
-		bool holding = false;
-		long long holdStartStep = -1;
-		bool autoReleasedThisHold = false;
+	// ---- input state --------------------------------------------------------
+
+	struct InputState {
+		bool physHeld = false;   // what your finger is doing
+		bool virtHeld = false;   // what the game has been told
+		bool pending = false;    // a held-back input waiting to go through
+		long long pendingAt = -1;
+		bool advanced = false;   // switched early, waiting for your real input
+		long long advanceDeadline = -1;
 	};
-	PlayerState g_states[2];
+	InputState g_inputs[2];
 
-	// Ship acceleration while holding / not holding, learned from play.
-	// Stored as if gravity were normal; index 0 = normal size, 1 = mini.
-	struct ShipAccel {
-		bool haveHeld = false;
-		bool haveReleased = false;
-		double held = 0;
-		double released = 0;
-	};
-	ShipAccel g_shipAccel[2];
+	// Set while the mod itself sends an input, so the hooks let it straight through.
+	bool g_applying = false;
 
-	OBB2D* g_playerBox = nullptr;
+	// ---- simulation state ---------------------------------------------------
 
-	// Moving-object tracking: where each nearby hazard/block was last tick and how fast it's moving.
+	PlayerObject* g_ghost = nullptr;
+	bool g_simulating = false;
+	bool g_simDead = false;
+	bool g_simUncertain = false;
+	float g_dt = 0.f;
+
+	// ---- moving-object tracking ---------------------------------------------
+
 	struct ObjectTrack {
 		CCPoint pos;
 		CCPoint vel;
@@ -99,11 +92,9 @@ namespace {
 	std::vector<GameObject*> g_watch;
 	long long g_watchBuiltStep = -1;
 
-	void clearTracks() {
-		g_tracks.clear();
-		g_watch.clear();
-		g_watchBuiltStep = -1;
-	}
+	OBB2D* g_playerBox = nullptr;
+
+	// ---- small helpers ------------------------------------------------------
 
 	bool enabled() {
 		return Mod::get()->getSettingValue<bool>("input-buffer");
@@ -117,23 +108,23 @@ namespace {
 		return player && player->m_isDart ? kStageTicksWave[g_stage] : kStageTicksAll[g_stage];
 	}
 
-	void resetStates() {
-		for (auto& s : g_states) s = PlayerState{};
+	bool holdMode(PlayerObject* p) {
+		return p->m_isDart || p->m_isShip;
 	}
 
-	PlayerState* stateFor(GJBaseGameLayer* layer, PlayerObject* player) {
-		if (!layer || !player) return nullptr;
-		if (player == layer->m_player1) return &g_states[0];
-		if (player == layer->m_player2) return &g_states[1];
-		return nullptr;
+	bool oneShotMode(PlayerObject* p) {
+		return p->m_isBall || p->m_isBird || p->m_isSpider || p->m_isSwing;
 	}
 
-	int sizeIndex(PlayerObject* player) {
-		return player->m_vehicleSize < 1.f ? 1 : 0;
+	int indexOf(GJBaseGameLayer* layer, PlayerObject* p) {
+		if (!layer || !p) return -1;
+		if (p == layer->m_player1) return 0;
+		if (p == layer->m_player2) return 1;
+		return -1;
 	}
 
-	double gravitySign(PlayerObject* player) {
-		return player->m_isUpsideDown ? -1.0 : 1.0;
+	bool canBuffer(PlayLayer* layer, PlayerObject* p) {
+		return layer && p && !layer->m_isPlatformer && !p->m_isSideways && !p->m_isDead;
 	}
 
 	std::string stageText() {
@@ -169,57 +160,94 @@ namespace {
 		}
 	}
 
-	double clampAccel(double a) {
-		return std::abs(a) > kMaxAccel ? 0.0 : a;
+	// Send an input to a real player, bypassing the buffer.
+	void sendInput(PlayerObject* p, bool down) {
+		g_applying = true;
+		if (down) p->pushButton(PlayerButton::Jump);
+		else p->releaseButton(PlayerButton::Jump);
+		g_applying = false;
 	}
 
-	void trackMovement(PlayerObject* player, PlayerState& s) {
-		if (!player) return;
-		CCPoint pos = player->m_position;
-		if (s.hasPrev) {
-			s.prevDy = s.lastDy;
-			s.prevMoveStep = s.lastMoveStep;
-			s.lastDx = pos.x - s.prev.x;
-			s.lastDy = pos.y - s.prev.y;
-			s.lastMoveStep = g_step;
+	void resetInputs() {
+		for (auto& s : g_inputs) s = InputState{};
+	}
 
-			// Learn the ship's acceleration. Zero means it's at max speed or touching
-			// a floor/ceiling, which says nothing about gravity, so skip it.
-			if (player->m_isShip && s.prevMoveStep == s.lastMoveStep - 1) {
-				double a = s.lastDy - s.prevDy;
-				if (std::abs(a) > 1e-4 && std::abs(a) <= kMaxAccel) {
-					auto& ship = g_shipAccel[sizeIndex(player)];
-					double normalized = a * gravitySign(player);
-					if (s.holding) {
-						ship.held = normalized;
-						ship.haveHeld = true;
-					} else {
-						ship.released = normalized;
-						ship.haveReleased = true;
-					}
+	// ---- moving-object tracking ---------------------------------------------
+
+	void clearTracks() {
+		g_tracks.clear();
+		g_watch.clear();
+		g_watchBuiltStep = -1;
+	}
+
+	bool isHazardType(GameObjectType type) {
+		return type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard;
+	}
+
+	// Rebuild the list of hazards/blocks near either player. Done every few ticks,
+	// since scanning the whole level every tick would be too slow.
+	void rebuildWatch(PlayLayer* layer) {
+		g_watch.clear();
+		g_watchBuiltStep = g_step;
+
+		std::vector<CCRect> areas;
+		for (auto player : {layer->m_player1, layer->m_player2}) {
+			if (!player) continue;
+			auto pos = player->m_position;
+			areas.emplace_back(pos.x - 250.f, pos.y - 450.f, 900.f, 900.f);
+		}
+		if (areas.empty()) return;
+
+		for (auto obj : CCArrayExt<GameObject*>(layer->m_objects)) {
+			if (!obj) continue;
+			auto type = obj->m_objectType;
+			if (!isHazardType(type) && type != GameObjectType::Solid) continue;
+			auto pos = obj->getPosition();
+			for (auto const& area : areas) {
+				if (area.containsPoint(pos)) {
+					g_watch.push_back(obj);
+					break;
 				}
 			}
 		}
-		s.prev = pos;
-		s.hasPrev = true;
+
+		for (auto it = g_tracks.begin(); it != g_tracks.end();) {
+			if (it->second.step < g_step - kWatchRefresh * 2) it = g_tracks.erase(it);
+			else ++it;
+		}
 	}
 
-	void noteInput(PlayerObject* player, PlayerButton button, bool isPush) {
-		if (button != PlayerButton::Jump || g_virtualRelease) return;
-		auto s = stateFor(PlayLayer::get(), player);
-		if (!s) return;
-		bool haveLast = s->lastMoveStep >= 0 && s->lastMoveStep < g_step;
-		bool haveAccel = haveLast && s->prevMoveStep == s->lastMoveStep - 1;
-		s->inputStep = g_step;
-		s->dyBeforeInput = haveLast ? s->lastDy : 0.0;
-		// The wave has no gravity; anything that looks like acceleration is a direction flip.
-		s->accelBeforeInput = (haveAccel && !player->m_isDart) ? clampAccel(s->lastDy - s->prevDy) : 0.0;
-		s->correctedThisInput = false;
-		if (isPush && !s->holding) {
-			s->holdStartStep = g_step;
-			s->autoReleasedThisHold = false;
+	void updateTracks(PlayLayer* layer) {
+		if (!active()) {
+			if (!g_tracks.empty() || !g_watch.empty()) clearTracks();
+			return;
 		}
-		s->holding = isPush;
+		if (g_watchBuiltStep < 0 || g_step - g_watchBuiltStep >= kWatchRefresh) {
+			rebuildWatch(layer);
+		}
+		for (auto obj : g_watch) {
+			auto const& rect = obj->getObjectRect();
+			CCPoint center{rect.getMidX(), rect.getMidY()};
+			auto& track = g_tracks[obj];
+			if (track.step == g_step - 1) {
+				CCPoint vel = center - track.pos;
+				bool teleported = std::abs(vel.x) > kMaxObjectSpeed || std::abs(vel.y) > kMaxObjectSpeed;
+				track.vel = teleported ? CCPoint{0.f, 0.f} : vel;
+			} else {
+				track.vel = CCPoint{0.f, 0.f};
+			}
+			track.pos = center;
+			track.step = g_step;
+		}
+	}
+
+	bool isMoving(GameObject* obj, CCPoint* velOut = nullptr) {
+		auto it = g_tracks.find(obj);
+		if (it == g_tracks.end() || it->second.step < g_step - 1) return false;
+		auto vel = it->second.vel;
+		if (std::abs(vel.x) < 0.01f && std::abs(vel.y) < 0.01f) return false;
+		if (velOut) *velOut = vel;
+		return true;
 	}
 
 	OBB2D* playerBox(CCRect const& r) {
@@ -253,349 +281,438 @@ namespace {
 		return r.intersectsRect(obj->getObjectRect());
 	}
 
-	bool insideSolid(CCRect const& r, GameObject* obj) {
-		// Shrink a little so standing on or sliding along a block doesn't count.
-		CCRect inner{r.origin.x + 1.f, r.origin.y + 1.f, r.size.width - 2.f, r.size.height - 2.f};
-		return inner.intersectsRect(obj->getObjectRect());
-	}
+	// ---- simulation ---------------------------------------------------------
 
-	// 0 = not something that can kill or block, 1 = hazard, 2 = solid.
-	int obstacleKind(PlayLayer* layer, GameObject* obj) {
-		if (!obj) return 0;
-		auto type = obj->m_objectType;
-		bool hazard = type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard;
-		bool solid = type == GameObjectType::Solid;
-		if (!hazard && !solid) return 0;
-		if (obj->m_isGroupDisabled || obj->m_isNoTouch || obj->m_isPassable) return 0;
-		if (obj == layer->m_anticheatSpike) return 0;
-		return hazard ? 1 : 2;
-	}
-
-	// Rebuild the list of obstacles near either player. Done every few ticks,
-	// since scanning the whole level every tick would be too slow.
-	void rebuildWatch(PlayLayer* layer) {
-		g_watch.clear();
-		g_watchBuiltStep = g_step;
-
-		std::vector<CCRect> areas;
-		for (auto player : {layer->m_player1, layer->m_player2}) {
-			if (!player) continue;
-			auto pos = player->m_position;
-			areas.emplace_back(pos.x - 250.f, pos.y - 450.f, 900.f, 900.f);
+	bool isInteractiveType(GameObjectType type) {
+		switch (type) {
+			case GameObjectType::InverseGravityPortal:
+			case GameObjectType::NormalGravityPortal:
+			case GameObjectType::ShipPortal:
+			case GameObjectType::CubePortal:
+			case GameObjectType::YellowJumpPad:
+			case GameObjectType::PinkJumpPad:
+			case GameObjectType::GravityPad:
+			case GameObjectType::YellowJumpRing:
+			case GameObjectType::PinkJumpRing:
+			case GameObjectType::GravityRing:
+			case GameObjectType::InverseMirrorPortal:
+			case GameObjectType::NormalMirrorPortal:
+			case GameObjectType::BallPortal:
+			case GameObjectType::RegularSizePortal:
+			case GameObjectType::MiniSizePortal:
+			case GameObjectType::UfoPortal:
+			case GameObjectType::Modifier:
+			case GameObjectType::DualPortal:
+			case GameObjectType::SoloPortal:
+			case GameObjectType::WavePortal:
+			case GameObjectType::RobotPortal:
+			case GameObjectType::TeleportPortal:
+			case GameObjectType::GreenRing:
+			case GameObjectType::DropRing:
+			case GameObjectType::SpiderPortal:
+			case GameObjectType::RedJumpPad:
+			case GameObjectType::RedJumpRing:
+			case GameObjectType::CustomRing:
+			case GameObjectType::DashRing:
+			case GameObjectType::GravityDashRing:
+			case GameObjectType::SwingPortal:
+			case GameObjectType::GravityTogglePortal:
+			case GameObjectType::SpiderOrb:
+			case GameObjectType::SpiderPad:
+			case GameObjectType::TeleportOrb:
+				return true;
+			default:
+				return false;
 		}
-		if (areas.empty()) return;
+	}
 
-		for (auto obj : CCArrayExt<GameObject*>(layer->m_objects)) {
-			if (!obstacleKind(layer, obj)) continue;
-			auto pos = obj->getPosition();
-			for (auto const& area : areas) {
-				if (area.containsPoint(pos)) {
-					g_watch.push_back(obj);
-					break;
+	void releaseGhost() {
+		if (!g_ghost) return;
+		g_ghost->removeFromParentAndCleanup(true);
+		g_ghost->release();
+		g_ghost = nullptr;
+	}
+
+	void ensureGhost(PlayLayer* layer) {
+		if (g_ghost || !layer || !layer->m_objectLayer) return;
+		g_ghost = PlayerObject::create(1, 1, layer, layer, true);
+		if (!g_ghost) return;
+		g_ghost->retain();
+		g_ghost->setPosition({0.f, 105.f});
+		g_ghost->setVisible(false);
+		layer->m_objectLayer->addChild(g_ghost);
+	}
+
+	void resetCollisionLog(PlayerObject* p) {
+		p->m_collisionLogTop->removeAllObjects();
+		p->m_collisionLogBottom->removeAllObjects();
+		p->m_collisionLogLeft->removeAllObjects();
+		p->m_collisionLogRight->removeAllObjects();
+	}
+
+	struct SimResult {
+		int survived;      // ticks before crashing (== horizon if it didn't)
+		bool uncertain;    // touched an orb/pad/portal, so don't trust it
+	};
+
+	// Run the hidden player from the real player's current state.
+	// startHeld: input state at the start. flipAt: tick at which the input
+	// switches (-1 = never). Returns how long it survives.
+	SimResult simulate(PlayLayer* layer, PlayerObject* real, bool startHeld, int flipAt, int horizon) {
+		if (!g_ghost || g_dt <= 0.f) return {horizon, true};
+
+		// Moving hazards are checked separately using their predicted positions.
+		struct MovingHazard {
+			GameObject* obj;
+			CCPoint vel;
+		};
+		std::vector<MovingHazard> moving;
+		for (auto obj : g_watch) {
+			if (!isHazardType(obj->m_objectType)) continue;
+			if (obj->m_isGroupDisabled || obj->m_isNoTouch) continue;
+			CCPoint vel;
+			if (isMoving(obj, &vel)) moving.push_back({obj, vel});
+		}
+
+		g_simulating = true;
+		g_simDead = false;
+		g_simUncertain = false;
+
+		auto ghost = g_ghost;
+		ghost->copyAttributes(real);
+		ghost->m_gravityMod = real->m_gravityMod;
+		ghost->m_isOnGround = real->m_isOnGround;
+		ghost->setVisible(false);
+		// In one-shot modes a press is an action, not a state, so don't replay it.
+		if (startHeld && !oneShotMode(real)) ghost->pushButton(PlayerButton::Jump);
+
+		int survived = horizon;
+		for (int i = 0; i < horizon; ++i) {
+			if (i == flipAt) {
+				if (startHeld) ghost->releaseButton(PlayerButton::Jump);
+				else ghost->pushButton(PlayerButton::Jump);
+			}
+			ghost->update(g_dt);
+			resetCollisionLog(ghost);
+			layer->checkCollisions(ghost, g_dt, false);
+
+			if (!g_simDead && !moving.empty()) {
+				auto const& rect = ghost->getObjectRect();
+				for (auto const& hazard : moving) {
+					// Instead of moving the hazard forward, move the player back the same amount.
+					CCRect relative = rect;
+					relative.origin.x -= hazard.vel.x * (i + 1);
+					relative.origin.y -= hazard.vel.y * (i + 1);
+					if (hitsHazard(relative, hazard.obj)) {
+						g_simDead = true;
+						break;
+					}
 				}
 			}
-		}
 
-		// Forget objects that are no longer nearby.
-		for (auto it = g_tracks.begin(); it != g_tracks.end();) {
-			if (it->second.step < g_step - kWatchRefresh * 2) it = g_tracks.erase(it);
-			else ++it;
-		}
-	}
-
-	// Record where each nearby obstacle is this tick and how far it moved since last tick.
-	void updateTracks(PlayLayer* layer) {
-		if (!active()) {
-			if (!g_tracks.empty() || !g_watch.empty()) clearTracks();
-			return;
-		}
-		if (g_watchBuiltStep < 0 || g_step - g_watchBuiltStep >= kWatchRefresh) {
-			rebuildWatch(layer);
-		}
-		for (auto obj : g_watch) {
-			auto const& rect = obj->getObjectRect();
-			CCPoint center{rect.getMidX(), rect.getMidY()};
-			auto& track = g_tracks[obj];
-			if (track.step == g_step - 1) {
-				CCPoint vel = center - track.pos;
-				bool teleported = std::abs(vel.x) > kMaxObjectSpeed || std::abs(vel.y) > kMaxObjectSpeed;
-				track.vel = teleported ? CCPoint{0.f, 0.f} : vel;
-			} else {
-				track.vel = CCPoint{0.f, 0.f};
-			}
-			track.pos = center;
-			track.step = g_step;
-		}
-	}
-
-	CCPoint velocityOf(GameObject* obj) {
-		auto it = g_tracks.find(obj);
-		if (it == g_tracks.end() || it->second.step < g_step - 1) return {0.f, 0.f};
-		return it->second.vel;
-	}
-
-	struct MovingObstacle {
-		GameObject* obj;
-		CCPoint vel;
-	};
-
-	struct Obstacles {
-		std::vector<MovingObstacle> hazards;
-		std::vector<GameObject*> solids;
-	};
-
-	Obstacles gatherObstacles(PlayLayer* layer, CCRect const& base, float reachX, float reachY) {
-		Obstacles out;
-		// Extra margin so hazards that will move into the path are included.
-		float margin = 150.f + kMaxObjectSpeed * kLookahead;
-		float minX = base.getMinX() - margin;
-		float maxX = base.getMaxX() + reachX + margin;
-		float minY = base.getMinY() - reachY - margin;
-		float maxY = base.getMaxY() + reachY + margin;
-
-		for (auto obj : CCArrayExt<GameObject*>(layer->m_objects)) {
-			int kind = obstacleKind(layer, obj);
-			if (!kind) continue;
-			auto pos = obj->getPosition();
-			if (pos.x < minX || pos.x > maxX || pos.y < minY || pos.y > maxY) continue;
-			if (kind == 1) out.hazards.push_back({obj, velocityOf(obj)});
-			else out.solids.push_back(obj);
-		}
-		return out;
-	}
-
-	bool pathClear(CCRect const& base, Obstacles const& obs, double shift, double dx, double dy, double accel) {
-		CCRect start = base;
-		start.origin.y += static_cast<float>(shift);
-		for (auto obj : obs.solids) {
-			if (insideSolid(start, obj)) return false;
-		}
-		for (int j = 0; j <= kLookahead; ++j) {
-			CCRect r = base;
-			r.origin.x += static_cast<float>(j * dx);
-			r.origin.y += static_cast<float>(shift + j * dy + 0.5 * j * (j + 1) * accel);
-			for (auto const& hazard : obs.hazards) {
-				// Instead of moving the hazard j ticks forward, move the player the opposite way.
-				CCRect relative = r;
-				relative.origin.x -= hazard.vel.x * j;
-				relative.origin.y -= hazard.vel.y * j;
-				if (hitsHazard(relative, hazard.obj)) return false;
+			if (g_simDead) {
+				survived = i;
+				break;
 			}
 		}
-		return true;
+
+		bool uncertain = g_simUncertain;
+		g_simulating = false;
+		g_simDead = false;
+		g_simUncertain = false;
+		return {survived, uncertain};
 	}
 
-	void movePlayer(PlayerObject* player, PlayerState* s, double shift) {
-		CCPoint pos = player->m_position;
-		pos.y += static_cast<float>(shift);
-		player->m_position = pos;
-		player->setPosition(pos);
-		s->prev.y += static_cast<float>(shift);
-		s->correctedStep = g_step;
-	}
+	// ---- decisions ----------------------------------------------------------
 
-	// Fix 1: treat the last click/release as if it happened a few ticks earlier or later.
-	bool shiftLastInput(PlayLayer* layer, PlayerObject* player, PlayerState* s) {
-		if (s->inputStep < 0 || s->correctedThisInput) return false;
+	// Your real input arrived. Returns true if it's being held back.
+	bool onPhysicalInput(PlayerObject* p, bool down) {
+		auto layer = PlayLayer::get();
+		int idx = indexOf(layer, p);
+		if (idx < 0) return false;
+		auto& s = g_inputs[idx];
+		s.physHeld = down;
 
-		long long since = g_step - s->inputStep;
-		if (since < 0 || since > kDeathWindow) return false;
-		s->correctedThisInput = true;
-
-		bool wave = player->m_isDart;
-		double dyNow;
-		double accelNow = 0.0;
-		if (s->lastMoveStep >= s->inputStep) {
-			dyNow = s->lastDy;
-			if (!wave && s->prevMoveStep >= s->inputStep && s->prevMoveStep == s->lastMoveStep - 1) {
-				accelNow = clampAccel(s->lastDy - s->prevDy);
-			}
-		} else if (wave && s->dyBeforeInput != 0.0) {
-			dyNow = -s->dyBeforeInput;
-		} else {
+		if (!active() || !canBuffer(layer, p)) {
+			s.virtHeld = down;
+			s.pending = false;
+			s.advanced = false;
 			return false;
 		}
 
-		// What the y-velocity would be now if the input had never happened.
-		double dyWithoutInput = s->dyBeforeInput + static_cast<double>(since) * s->accelBeforeInput;
-		double delta = dyNow - dyWithoutInput;
-		double dx = s->lastDx;
-		if (std::abs(delta) < 0.05 || std::abs(dx) < 0.01) return false;
+		// The mod already switched early; this is your input catching up.
+		if (s.advanced && down == s.virtHeld) {
+			s.advanced = false;
+			log::info("[InputBuffer] Your input caught up with an early switch");
+			return true;
+		}
+		// A held-back input hadn't gone through yet and you've switched back.
+		if (s.pending && down == s.virtHeld) {
+			s.pending = false;
+			return true;
+		}
+		// Nothing changes for the game (e.g. GD re-sending a hold); let it through.
+		if (down == s.virtHeld) return false;
 
-		int maxTicks = ticksFor(player);
-		CCRect base = player->getObjectRect();
-		float reachY = static_cast<float>(
-			std::min(std::abs(delta) * maxTicks, kMaxShift)
-			+ std::abs(dyNow) * kLookahead
-			+ 0.5 * kLookahead * (kLookahead + 1) * std::abs(accelNow)
-		);
-		auto obstacles = gatherObstacles(layer, base, static_cast<float>(std::abs(dx) * kLookahead), reachY);
+		// Releases don't matter in one-shot modes.
+		if (!down && oneShotMode(p)) {
+			s.virtHeld = down;
+			return false;
+		}
 
-		for (int k = 1; k <= maxTicks; ++k) {
-			for (int dir : {1, -1}) {
-				// "Later" can't go past the moment the input actually happened.
-				if (dir == -1 && k > since) continue;
-				double shift = dir * k * delta;
-				if (std::abs(shift) > kMaxShift) continue;
-				if (!pathClear(base, obstacles, shift, dx, dyNow, accelNow)) continue;
+		ensureGhost(layer);
+		int n = ticksFor(p);
+		int danger = n + kDangerExtra;
 
-				movePlayer(player, s, shift);
+		auto now = simulate(layer, p, s.virtHeld, 0, kHorizon);
+		if (now.uncertain || now.survived >= danger) {
+			s.virtHeld = down;
+			return false;
+		}
+
+		for (int k = 1; k <= n; ++k) {
+			auto later = simulate(layer, p, s.virtHeld, k, kHorizon);
+			if (later.uncertain) break;
+			if (later.survived >= std::min(kHorizon, k + danger)) {
+				s.pending = true;
+				s.pendingAt = g_step + k;
 				log::info(
-					"[InputBuffer] Trajectory fix ({}): input treated as {} tick(s) {} (shift {:.2f})",
-					wave ? "wave" : "other", k, dir == 1 ? "earlier" : "later", shift
+					"[InputBuffer] {} held back {} tick(s) (now: crash in {}, later: {})",
+					down ? "Click" : "Release", k, now.survived, later.survived
 				);
 				return true;
 			}
 		}
+
+		// Nothing in range helps; your input goes through as-is.
+		s.virtHeld = down;
 		return false;
 	}
 
-	// Fix 2: the player held too long; release for them as if they'd let go a few ticks ago.
-	bool releaseEarly(PlayLayer* layer, PlayerObject* player, PlayerState* s) {
-		if (!s->holding || s->autoReleasedThisHold) return false;
-		bool wave = player->m_isDart;
-		bool ship = player->m_isShip;
-		if (!wave && !ship) return false;
-		if (s->lastMoveStep < 0) return false;
-		s->autoReleasedThisHold = true;
+	// Called at the start of every tick, before GD processes it.
+	void beforeTick(PlayLayer* layer, PlayerObject* p, InputState& s) {
+		if (!p) return;
 
-		double dx = s->lastDx;
-		double dyNow = s->lastDy;
-		if (std::abs(dx) < 0.01) return false;
-
-		// Can't release before the click started.
-		long long heldFor = s->holdStartStep >= 0 ? g_step - s->holdStartStep : kDeathWindow;
-		int maxTicks = static_cast<int>(std::min<long long>(ticksFor(player), heldFor));
-		if (maxTicks < 1) return false;
-
-		// Per-tick effect of having released one tick earlier, and the motion right after release.
-		double dyAfter;
-		double accelAfter;
-		double accelDiff = 0.0;
-		if (wave) {
-			if (std::abs(dyNow) < 0.05) return false;
-			dyAfter = -dyNow;
-			accelAfter = 0.0;
-		} else {
-			auto const& learned = g_shipAccel[sizeIndex(player)];
-			if (!learned.haveHeld || !learned.haveReleased) return false;
-			double sign = gravitySign(player);
-			accelDiff = (learned.released - learned.held) * sign;
-			dyAfter = dyNow;
-			accelAfter = learned.released * sign;
+		// Buffer turned off (or not usable here): make the game match your finger.
+		if (!active() || !canBuffer(layer, p)) {
+			if (s.pending || s.advanced || s.virtHeld != s.physHeld) {
+				s.pending = false;
+				s.advanced = false;
+				if (s.virtHeld != s.physHeld) {
+					s.virtHeld = s.physHeld;
+					sendInput(p, s.physHeld);
+				}
+			}
+			return;
 		}
 
-		auto shiftFor = [&](int k) {
-			// Wave: k ticks going the other way. Ship: k ticks of different acceleration.
-			return wave ? -2.0 * k * dyNow : 0.5 * k * (k + 1) * accelDiff;
-		};
+		if (s.pending && g_step >= s.pendingAt) {
+			s.pending = false;
+			s.virtHeld = s.physHeld;
+			sendInput(p, s.physHeld);
+			return;
+		}
 
-		CCRect base = player->getObjectRect();
-		float reachY = static_cast<float>(
-			std::min(std::abs(shiftFor(maxTicks)), kMaxShift)
-			+ std::abs(dyAfter) * kLookahead
-			+ 0.5 * kLookahead * (kLookahead + 1) * std::abs(accelAfter)
+		if (s.advanced && g_step >= s.advanceDeadline) {
+			// Your input never came; undo the early switch.
+			s.advanced = false;
+			s.virtHeld = s.physHeld;
+			sendInput(p, s.physHeld);
+			log::info("[InputBuffer] Early switch undone (no input from you in time)");
+			return;
+		}
+
+		// Switch early: only for wave/ship, only when in sync with your finger.
+		if (s.pending || s.advanced || s.virtHeld != s.physHeld || !holdMode(p)) return;
+
+		int n = ticksFor(p);
+		ensureGhost(layer);
+		auto keep = simulate(layer, p, s.virtHeld, -1, n + 1);
+		if (keep.uncertain || keep.survived > n) return;
+
+		auto flip = simulate(layer, p, s.virtHeld, 0, kHorizon);
+		if (flip.uncertain || flip.survived < std::min(kHorizon, n + kDangerExtra)) return;
+
+		s.advanced = true;
+		s.advanceDeadline = g_step + n;
+		s.virtHeld = !s.virtHeld;
+		sendInput(p, s.virtHeld);
+		log::info(
+			"[InputBuffer] Early {} (crash in {} otherwise)",
+			s.virtHeld ? "click" : "release", keep.survived
 		);
-		auto obstacles = gatherObstacles(layer, base, static_cast<float>(std::abs(dx) * kLookahead), reachY);
-
-		for (int k = 1; k <= maxTicks; ++k) {
-			double shift = shiftFor(k);
-			if (std::abs(shift) < 0.01 || std::abs(shift) > kMaxShift) continue;
-			if (!pathClear(base, obstacles, shift, dx, dyAfter, accelAfter)) continue;
-
-			movePlayer(player, s, shift);
-
-			g_virtualRelease = true;
-			player->releaseButton(PlayerButton::Jump);
-			g_virtualRelease = false;
-
-			s->holding = false;
-			s->inputStep = g_step;
-			s->dyBeforeInput = dyNow;
-			s->accelBeforeInput = 0.0;
-			s->correctedThisInput = true;
-
-			log::info(
-				"[InputBuffer] Early release ({}): released {} tick(s) early (shift {:.2f})",
-				wave ? "wave" : "ship", k, shift
-			);
-			return true;
-		}
-		return false;
-	}
-
-	// Returns true if the death was avoided.
-	bool tryCorrect(PlayLayer* layer, PlayerObject* player, GameObject* killer) {
-		if (!active() || !player || !killer) return false;
-		if (killer == layer->m_anticheatSpike) return false;
-		if (layer->m_isPlatformer || player->m_isSideways) return false;
-
-		auto s = stateFor(layer, player);
-		if (!s) return false;
-
-		// Already moved the player this tick; GD is still finishing checks against the old spot.
-		if (s->correctedStep == g_step) return true;
-
-		if (shiftLastInput(layer, player, s)) return true;
-		if (releaseEarly(layer, player, s)) return true;
-		return false;
 	}
 }
 
+// ---- hooks ------------------------------------------------------------------
+
 class $modify(BufferPlayLayer, PlayLayer) {
 	bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+		releaseGhost();
 		clearTracks();
+		resetInputs();
 		if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
 			return false;
 		}
-		resetStates();
+		if (active()) ensureGhost(this);
 		updateIndicator(this);
 		return true;
 	}
 
 	void resetLevel() {
 		PlayLayer::resetLevel();
-		resetStates();
+		resetInputs();
 		clearTracks();
 		updateIndicator(this);
 	}
 
 	void onQuit() {
+		releaseGhost();
 		clearTracks();
+		resetInputs();
 		PlayLayer::onQuit();
 	}
 
 	void destroyPlayer(PlayerObject* player, GameObject* object) {
-		if (tryCorrect(this, player, object)) {
+		if (g_simulating) {
+			if (player == g_ghost) g_simDead = true;
 			return;
 		}
 		PlayLayer::destroyPlayer(player, object);
+	}
+
+	void playEndAnimationToPos(CCPoint position) {
+		if (g_simulating) return;
+		PlayLayer::playEndAnimationToPos(position);
+	}
+
+	void levelComplete() {
+		if (g_simulating) return;
+		PlayLayer::levelComplete();
 	}
 };
 
 class $modify(BufferGameLayer, GJBaseGameLayer) {
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 		auto playLayer = typeinfo_cast<PlayLayer*>(this);
-		if (!playLayer) {
+		if (playLayer) {
+			beforeTick(playLayer, m_player1, g_inputs[0]);
+			beforeTick(playLayer, m_player2, g_inputs[1]);
+		}
+		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+		if (playLayer) {
+			updateTracks(playLayer);
+			++g_step;
+		}
+	}
+
+	// While simulating, the hidden player only collides with blocks, slopes and
+	// still hazards (moving ones are checked separately). Touching anything that
+	// would do something (orbs, pads, portals) marks the prediction as unreliable.
+	void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int objectCount, float dt) {
+		if (!g_simulating) {
+			GJBaseGameLayer::collisionCheckObjects(player, objects, objectCount, dt);
 			return;
 		}
-		trackMovement(m_player1, g_states[0]);
-		trackMovement(m_player2, g_states[1]);
-		updateTracks(playLayer);
-		++g_step;
+		gd::vector<GameObject*> kept;
+		auto const& playerRect = player->getObjectRect();
+		for (int i = 0; i < objectCount; ++i) {
+			GameObject* obj = objects->at(i);
+			if (!obj) continue;
+			auto type = obj->m_objectType;
+			if (type == GameObjectType::Solid || type == GameObjectType::Slope) {
+				kept.push_back(obj);
+			} else if (isHazardType(type)) {
+				if (!isMoving(obj)) kept.push_back(obj);
+			} else if (isInteractiveType(type) && !obj->m_isGroupDisabled) {
+				if (obj->getObjectRect().intersectsRect(playerRect)) g_simUncertain = true;
+			}
+		}
+		GJBaseGameLayer::collisionCheckObjects(player, &kept, static_cast<int>(kept.size()), dt);
+	}
+
+	bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
+		if (g_simulating) return false;
+		return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
+	}
+
+	void playerTouchedRing(PlayerObject* player, RingObject* ring) {
+		if (g_simulating) return;
+		GJBaseGameLayer::playerTouchedRing(player, ring);
+	}
+
+	void flipGravity(PlayerObject* player, bool flip, bool noEffects) {
+		if (g_simulating) {
+			// Flip only the hidden player, with no effects and nothing else touched.
+			static bool inFlip = false;
+			if (player == g_ghost && !inFlip) {
+				inFlip = true;
+				player->flipGravity(flip, true);
+				inFlip = false;
+			}
+			return;
+		}
+		GJBaseGameLayer::flipGravity(player, flip, noEffects);
 	}
 };
 
 class $modify(BufferPlayer, PlayerObject) {
+	void update(float dt) {
+		PlayerObject::update(dt);
+		if (!g_simulating && this != g_ghost) {
+			auto layer = PlayLayer::get();
+			if (layer && indexOf(layer, this) >= 0) g_dt = dt;
+		}
+	}
+
 	bool pushButton(PlayerButton button) {
-		noteInput(this, button, true);
+		if (button == PlayerButton::Jump && !g_applying && !g_simulating && this != g_ghost) {
+			if (onPhysicalInput(this, true)) return true;
+		}
 		return PlayerObject::pushButton(button);
 	}
 
 	bool releaseButton(PlayerButton button) {
-		noteInput(this, button, false);
+		if (button == PlayerButton::Jump && !g_applying && !g_simulating && this != g_ghost) {
+			if (onPhysicalInput(this, false)) return true;
+		}
 		return PlayerObject::releaseButton(button);
+	}
+
+	void playSpiderDashEffect(CCPoint from, CCPoint to) {
+		if (g_simulating) return;
+		PlayerObject::playSpiderDashEffect(from, to);
+	}
+
+	void incrementJumps() {
+		if (g_simulating) return;
+		PlayerObject::incrementJumps();
+	}
+
+	void ringJump(RingObject* ring, bool skipCheck) {
+		if (g_simulating) return;
+		PlayerObject::ringJump(ring, skipCheck);
+	}
+};
+
+class $modify(BufferHardStreak, HardStreak) {
+	void addPoint(CCPoint point) {
+		if (g_simulating) return;
+		HardStreak::addPoint(point);
+	}
+};
+
+class $modify(BufferEffectObject, EffectGameObject) {
+	void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
+		if (g_simulating) return;
+		EffectGameObject::triggerObject(layer, uniqueID, remapKeys);
+	}
+};
+
+class $modify(BufferGameObject, GameObject) {
+	void playShineEffect() {
+		if (g_simulating) return;
+		GameObject::playShineEffect();
 	}
 };
 
@@ -604,6 +721,7 @@ class $modify(BufferKeys, CCKeyboardDispatcher) {
 		if (key == enumKeyCodes::KEY_F6 && isKeyDown && !isKeyRepeat && enabled()) {
 			if (auto layer = PlayLayer::get()) {
 				g_stage = (g_stage + 1) % kStageCount;
+				if (active()) ensureGhost(layer);
 				updateIndicator(layer);
 				auto text = "Input buffer: " + stageText();
 				log::info("[InputBuffer] F6 Cycle -> {}", text);

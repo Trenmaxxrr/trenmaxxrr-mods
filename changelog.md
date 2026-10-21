@@ -1,3 +1,10 @@
+# v2.0.0
+- Rewrite: the buffer now changes input timing instead of moving your player.
+- Predictions run a hidden copy of your player through GD's own physics and collisions (orbs, pads, portals and triggers are blocked during predictions; if one is touched, your input goes through untouched).
+- Holds back clicks/releases that would crash you if a slightly later one wouldn't.
+- Wave and ship: switches early when you're about to crash, then waits up to the stage's tick count for your real input; if it doesn't come, it switches back.
+- Moving hazards still use their predicted positions.
+
 # v1.4.0
 - Moving hazards: while the buffer is on, nearby spikes, saws and blocks are tracked every tick, so a fix won't put you where a moving hazard is about to be (or skip a spot one is about to leave).
 
