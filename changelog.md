@@ -1,3 +1,12 @@
+# v2.0.1
+Fixes from an audit for unintended help:
+- An early switch your input never confirmed now counts as a crash. Before, switching back still let you keep the dodge, so the mod could clear an obstacle with no input from you. Turning the buffer off mid-switch counts the same way.
+- Predictions no longer set off the level's event triggers (the hidden player's jumps and landings were firing them).
+- The mod never blocks a real death; only the hidden player's crashes are caught.
+- The on-screen label is re-checked every tick, so the buffer can't run without it showing.
+- Quick taps made while an input is held back are kept (they were being dropped).
+- Turning the buffer off removes the hidden player from the level right away.
+
 # v2.0.0
 - Rewrite: the buffer now changes input timing instead of moving your player.
 - Predictions run a hidden copy of your player through GD's own physics and collisions (orbs, pads, portals and triggers are blocked during predictions; if one is touched, your input goes through untouched).

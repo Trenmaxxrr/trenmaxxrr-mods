@@ -8,7 +8,7 @@
 	},
 	"id": "trenmaxxrr.hacks",
 	"name": "Trenmaxxrr Hacks",
-	"version": "v2.0.0",
+	"version": "v2.0.1",
 	"developer": "Trenmaxxrr",
 	"description": "Custom hacks, each one toggleable in this mod's settings.",
 	"dependencies": {
@@ -24,7 +24,7 @@
 		"input-buffer": {
 			"type": "bool",
 			"name": "Input buffer (F6)",
-			"description": "Lets F6 cycle the input buffer in levels: off, 2, 4, 8, 16 ticks (wave capped at 8). It predicts your path with GD's own physics and shifts the timing of your clicks and releases (never moves your player): holds back inputs that would crash you, and on wave/ship switches early when you're about to crash, waiting for your input to catch up. Not in platformer or vertical sections. It starts off every time you open GD, and an on-screen label always shows while it's on.",
+			"description": "Lets F6 cycle the input buffer in levels: off, 2, 4, 8, 16 ticks (wave capped at 8). It predicts your path with GD's own physics and shifts the timing of your clicks and releases (never moves your player): holds back inputs that would crash you, and on wave/ship switches early when you're about to crash, waiting for your input to catch up (if it doesn't, that counts as a crash). Not in platformer or vertical sections. It starts off every time you open GD, and an on-screen label always shows while it's on.",
 			"default": true
 		}
 	}

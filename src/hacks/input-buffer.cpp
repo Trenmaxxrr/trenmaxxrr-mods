@@ -11,7 +11,8 @@
 //   but doing it up to N ticks later wouldn't, the input is delayed.
 // - Switch early (wave and ship only): when you're about to crash within N
 //   ticks and switching now would save you, it switches now and waits up to
-//   N ticks for your real input. If yours doesn't come, it switches back.
+//   N ticks for your real input. If yours doesn't come, that counts as the
+//   crash you would have had (just switching back would keep the dodge).
 //   One-shot modes (cube jump, ball/UFO/spider/swing) don't get this, since
 //   a jump can't be taken back; that would be the mod playing for you.
 // - If the hidden player touches an orb, pad or portal, the prediction isn't
@@ -60,15 +61,26 @@ namespace {
 
 	// ---- input state --------------------------------------------------------
 
+	struct QueuedInput {
+		long long at;
+		bool down;
+	};
+
 	struct InputState {
 		bool physHeld = false;   // what your finger is doing
 		bool virtHeld = false;   // what the game has been told
-		bool pending = false;    // a held-back input waiting to go through
-		long long pendingAt = -1;
+		// Held-back inputs, in order. Every input while something is held back
+		// gets the same delay, so quick taps stay taps instead of being dropped.
+		std::vector<QueuedInput> queue;
+		long long queueDelay = 0;
 		bool advanced = false;   // switched early, waiting for your real input
 		long long advanceDeadline = -1;
 	};
 	InputState g_inputs[2];
+
+	// Label state, so it can be re-shown every tick if anything hides it.
+	bool g_labelOn = false;
+	int g_labelStage = -1;
 
 	// Set while the mod itself sends an input, so the hooks let it straight through.
 	bool g_applying = false;
@@ -151,6 +163,8 @@ namespace {
 		}
 		bool on = active();
 		label->setVisible(on);
+		g_labelOn = on;
+		g_labelStage = g_stage;
 		if (on) {
 			std::string text = "INPUT BUFFER: " + stageText();
 			std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
@@ -170,6 +184,42 @@ namespace {
 
 	void resetInputs() {
 		for (auto& s : g_inputs) s = InputState{};
+	}
+
+	// The label must be showing whenever the buffer is on. Checked every tick,
+	// so turning the setting on mid-level (or anything hiding the label) can't
+	// leave the buffer running without it.
+	void syncIndicator(PlayLayer* layer) {
+		bool on = active();
+		if (on != g_labelOn || (on && g_labelStage != g_stage)) {
+			updateIndicator(layer);
+			return;
+		}
+		if (on) {
+			auto label = layer->getChildByID("input-buffer-label"_spr);
+			if (!label || !label->isVisible()) updateIndicator(layer);
+		}
+	}
+
+	// Send every held-back input now, in order.
+	void flushQueue(PlayerObject* p, InputState& s) {
+		for (auto const& input : s.queue) {
+			s.virtHeld = input.down;
+			sendInput(p, input.down);
+		}
+		s.queue.clear();
+	}
+
+	// An early switch your input never confirmed. Switching back alone would
+	// keep the dodge it already gave you, so it counts as the crash you'd have had.
+	void failEarlySwitch(PlayLayer* layer, PlayerObject* p, InputState& s) {
+		s.advanced = false;
+		s.virtHeld = s.physHeld;
+		sendInput(p, s.physHeld);
+		if (!p->m_isDead) {
+			log::info("[InputBuffer] Early switch not confirmed by your input; counting it as a crash");
+			layer->destroyPlayer(p, nullptr);
+		}
 	}
 
 	// ---- moving-object tracking ---------------------------------------------
@@ -433,24 +483,27 @@ namespace {
 		auto& s = g_inputs[idx];
 		s.physHeld = down;
 
-		if (!active() || !canBuffer(layer, p)) {
-			s.virtHeld = down;
-			s.pending = false;
-			s.advanced = false;
-			return false;
-		}
-
 		// The mod already switched early; this is your input catching up.
 		if (s.advanced && down == s.virtHeld) {
 			s.advanced = false;
 			log::info("[InputBuffer] Your input caught up with an early switch");
 			return true;
 		}
-		// A held-back input hadn't gone through yet and you've switched back.
-		if (s.pending && down == s.virtHeld) {
-			s.pending = false;
+
+		if (!active() || !canBuffer(layer, p)) {
+			// Anything still held back goes through first, so nothing is dropped or reordered.
+			if (!s.queue.empty()) flushQueue(p, s);
+			s.virtHeld = down;
+			return false;
+		}
+
+		// Something is already held back: this input gets the same delay, so a
+		// quick tap stays a tap instead of being swallowed.
+		if (!s.queue.empty()) {
+			s.queue.push_back({g_step + s.queueDelay, down});
 			return true;
 		}
+
 		// Nothing changes for the game (e.g. GD re-sending a hold); let it through.
 		if (down == s.virtHeld) return false;
 
@@ -474,8 +527,8 @@ namespace {
 			auto later = simulate(layer, p, s.virtHeld, k, kHorizon);
 			if (later.uncertain) break;
 			if (later.survived >= std::min(kHorizon, k + danger)) {
-				s.pending = true;
-				s.pendingAt = g_step + k;
+				s.queue.push_back({g_step + k, down});
+				s.queueDelay = k;
 				log::info(
 					"[InputBuffer] {} held back {} tick(s) (now: crash in {}, later: {})",
 					down ? "Click" : "Release", k, now.survived, later.survived
@@ -493,37 +546,44 @@ namespace {
 	void beforeTick(PlayLayer* layer, PlayerObject* p, InputState& s) {
 		if (!p) return;
 
+		// Already dead: nothing to send; start clean next attempt.
+		if (p->m_isDead) {
+			s.queue.clear();
+			s.advanced = false;
+			s.virtHeld = s.physHeld;
+			return;
+		}
+
 		// Buffer turned off (or not usable here): make the game match your finger.
+		// An unconfirmed early switch still counts as a crash, so turning the
+		// buffer off mid-switch can't be used to keep the dodge.
 		if (!active() || !canBuffer(layer, p)) {
-			if (s.pending || s.advanced || s.virtHeld != s.physHeld) {
-				s.pending = false;
-				s.advanced = false;
-				if (s.virtHeld != s.physHeld) {
-					s.virtHeld = s.physHeld;
-					sendInput(p, s.physHeld);
-				}
+			if (!s.queue.empty()) flushQueue(p, s);
+			if (s.advanced) {
+				failEarlySwitch(layer, p, s);
+			} else if (s.virtHeld != s.physHeld) {
+				s.virtHeld = s.physHeld;
+				sendInput(p, s.physHeld);
 			}
 			return;
 		}
 
-		if (s.pending && g_step >= s.pendingAt) {
-			s.pending = false;
-			s.virtHeld = s.physHeld;
-			sendInput(p, s.physHeld);
-			return;
+		// Send held-back inputs that are due, in order.
+		while (!s.queue.empty() && s.queue.front().at <= g_step) {
+			auto input = s.queue.front();
+			s.queue.erase(s.queue.begin());
+			s.virtHeld = input.down;
+			sendInput(p, input.down);
 		}
+		if (!s.queue.empty()) return;
 
-		if (s.advanced && g_step >= s.advanceDeadline) {
-			// Your input never came; undo the early switch.
-			s.advanced = false;
-			s.virtHeld = s.physHeld;
-			sendInput(p, s.physHeld);
-			log::info("[InputBuffer] Early switch undone (no input from you in time)");
+		if (s.advanced) {
+			if (g_step >= s.advanceDeadline) failEarlySwitch(layer, p, s);
 			return;
 		}
 
 		// Switch early: only for wave/ship, only when in sync with your finger.
-		if (s.pending || s.advanced || s.virtHeld != s.physHeld || !holdMode(p)) return;
+		if (s.virtHeld != s.physHeld || !holdMode(p)) return;
 
 		int n = ticksFor(p);
 		ensureGhost(layer);
@@ -574,8 +634,9 @@ class $modify(BufferPlayLayer, PlayLayer) {
 	}
 
 	void destroyPlayer(PlayerObject* player, GameObject* object) {
-		if (g_simulating) {
-			if (player == g_ghost) g_simDead = true;
+		// Only the hidden player's crashes are caught. The mod never stops a real death.
+		if (g_simulating && player == g_ghost) {
+			g_simDead = true;
 			return;
 		}
 		PlayLayer::destroyPlayer(player, object);
@@ -596,6 +657,7 @@ class $modify(BufferGameLayer, GJBaseGameLayer) {
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
 		auto playLayer = typeinfo_cast<PlayLayer*>(this);
 		if (playLayer) {
+			syncIndicator(playLayer);
 			beforeTick(playLayer, m_player1, g_inputs[0]);
 			beforeTick(playLayer, m_player2, g_inputs[1]);
 		}
@@ -629,6 +691,12 @@ class $modify(BufferGameLayer, GJBaseGameLayer) {
 			}
 		}
 		GJBaseGameLayer::collisionCheckObjects(player, &kept, static_cast<int>(kept.size()), dt);
+	}
+
+	// The hidden player's jumps and landings must not set off the level's event triggers.
+	void gameEventTriggered(GJGameEvent event, int material, int playerID) {
+		if (g_simulating) return;
+		GJBaseGameLayer::gameEventTriggered(event, material, playerID);
 	}
 
 	bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
@@ -721,7 +789,12 @@ class $modify(BufferKeys, CCKeyboardDispatcher) {
 		if (key == enumKeyCodes::KEY_F6 && isKeyDown && !isKeyRepeat && enabled()) {
 			if (auto layer = PlayLayer::get()) {
 				g_stage = (g_stage + 1) % kStageCount;
+				// Off means nothing of the buffer stays in the level.
 				if (active()) ensureGhost(layer);
+				else {
+					releaseGhost();
+					clearTracks();
+				}
 				updateIndicator(layer);
 				auto text = "Input buffer: " + stageText();
 				log::info("[InputBuffer] F6 Cycle -> {}", text);
