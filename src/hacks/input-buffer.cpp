@@ -1,10 +1,15 @@
-// Input buffer ("wave spikes/saws trajectory fix").
+// Input buffer ("trajectory fix"), all gamemodes.
 //
-// When the wave is about to die shortly after a click, check whether the same
-// click a few ticks earlier or later would have been safe. If one would, move
-// the wave to where that click would have put it instead of dying.
+// When a player is about to die shortly after a click or release, estimate
+// where they'd be if that input had happened a few ticks earlier or later. If
+// one of those spots is clear of hazards (and stays clear for a few ticks),
+// move the player there instead of dying.
 //
-// F6 (in a level) cycles: OFF -> 2 -> 4 -> 8 -> 16 ticks -> OFF.
+// The estimate: shifting an input by k ticks moves the player by about
+// k * (current y-velocity - the y-velocity they'd have without the input).
+// For the wave that's exact; for gravity modes it's a close first-order guess.
+//
+// F6 (in a level) cycles: OFF -> 2 -> 4 -> 8 -> 16 ticks (wave capped at 8) -> OFF.
 // It starts OFF every session. While it's on, an on-screen label always shows
 // the current stage; that label can't be turned off.
 
@@ -15,6 +20,7 @@
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -22,28 +28,37 @@
 using namespace geode::prelude;
 
 namespace {
-	constexpr int kStageTicks[] = {0, 2, 4, 8, 16};
+	// Same stages as the original: all gamemodes / wave.
+	constexpr int kStageTicksAll[] = {0, 2, 4, 8, 16};
+	constexpr int kStageTicksWave[] = {0, 2, 4, 8, 8};
 	constexpr int kStageCount = 5;
-	// A death counts as "caused by the last click" if it happens within this many ticks of it.
+	// A death counts as "caused by the last input" if it happens within this many ticks of it.
 	constexpr long long kDeathWindow = 48;
-	// After moving the wave, the new path is checked this many ticks ahead for hazards.
+	// After moving the player, the new path is checked this many ticks ahead for hazards.
 	constexpr int kLookahead = 8;
+	// Never move the player further than this (about 3 blocks).
+	constexpr double kMaxShift = 90.0;
+	// Velocity changes bigger than this between ticks are portals/teleports, not gravity.
+	constexpr double kMaxAccel = 3.0;
 
 	int g_stage = 0;
 	long long g_step = 0;
 
-	struct WaveState {
+	struct PlayerState {
 		bool hasPrev = false;
 		CCPoint prev;
 		double lastDx = 0;
 		double lastDy = 0;
+		double prevDy = 0;
 		long long lastMoveStep = -1;
+		long long prevMoveStep = -1;
 		long long inputStep = -1;
 		double dyBeforeInput = 0;
+		double accelBeforeInput = 0;
 		bool correctedThisInput = false;
 		long long correctedStep = -1;
 	};
-	WaveState g_states[2];
+	PlayerState g_states[2];
 
 	OBB2D* g_playerBox = nullptr;
 
@@ -55,15 +70,15 @@ namespace {
 		return g_stage != 0 && enabled();
 	}
 
-	int stageTicks() {
-		return kStageTicks[g_stage];
+	int ticksFor(PlayerObject* player) {
+		return player && player->m_isDart ? kStageTicksWave[g_stage] : kStageTicksAll[g_stage];
 	}
 
 	void resetStates() {
-		for (auto& s : g_states) s = WaveState{};
+		for (auto& s : g_states) s = PlayerState{};
 	}
 
-	WaveState* stateFor(GJBaseGameLayer* layer, PlayerObject* player) {
+	PlayerState* stateFor(GJBaseGameLayer* layer, PlayerObject* player) {
 		if (!layer || !player) return nullptr;
 		if (player == layer->m_player1) return &g_states[0];
 		if (player == layer->m_player2) return &g_states[1];
@@ -72,7 +87,11 @@ namespace {
 
 	std::string stageText() {
 		if (g_stage == 0) return "OFF (100% raw input)";
-		return std::to_string(stageTicks()) + " ticks";
+		int all = kStageTicksAll[g_stage];
+		int wave = kStageTicksWave[g_stage];
+		auto text = std::to_string(all) + " ticks";
+		if (wave != all) text += " (wave " + std::to_string(wave) + ")";
+		return text;
 	}
 
 	void updateIndicator(PlayLayer* layer) {
@@ -91,15 +110,24 @@ namespace {
 		bool on = active();
 		label->setVisible(on);
 		if (on) {
-			auto text = "INPUT BUFFER: " + std::to_string(stageTicks()) + " TICKS";
+			std::string text = "INPUT BUFFER: " + stageText();
+			std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+				return static_cast<char>(std::toupper(c));
+			});
 			label->setString(text.c_str());
 		}
 	}
 
-	void trackMovement(PlayerObject* player, WaveState& s) {
+	double clampAccel(double a) {
+		return std::abs(a) > kMaxAccel ? 0.0 : a;
+	}
+
+	void trackMovement(PlayerObject* player, PlayerState& s) {
 		if (!player) return;
 		CCPoint pos = player->m_position;
 		if (s.hasPrev) {
+			s.prevDy = s.lastDy;
+			s.prevMoveStep = s.lastMoveStep;
 			s.lastDx = pos.x - s.prev.x;
 			s.lastDy = pos.y - s.prev.y;
 			s.lastMoveStep = g_step;
@@ -109,11 +137,15 @@ namespace {
 	}
 
 	void noteInput(PlayerObject* player, PlayerButton button) {
-		if (button != PlayerButton::Jump || !player->m_isDart) return;
+		if (button != PlayerButton::Jump) return;
 		auto s = stateFor(PlayLayer::get(), player);
 		if (!s) return;
+		bool haveLast = s->lastMoveStep >= 0 && s->lastMoveStep < g_step;
+		bool haveAccel = haveLast && s->prevMoveStep == s->lastMoveStep - 1;
 		s->inputStep = g_step;
-		s->dyBeforeInput = (s->lastMoveStep >= 0 && s->lastMoveStep < g_step) ? s->lastDy : 0.0;
+		s->dyBeforeInput = haveLast ? s->lastDy : 0.0;
+		// The wave has no gravity; anything that looks like acceleration is a direction flip.
+		s->accelBeforeInput = (haveAccel && !player->m_isDart) ? clampAccel(s->lastDy - s->prevDy) : 0.0;
 		s->correctedThisInput = false;
 	}
 
@@ -149,7 +181,7 @@ namespace {
 	}
 
 	bool insideSolid(CCRect const& r, GameObject* obj) {
-		// Shrink a little so sliding along a floor or ceiling doesn't count.
+		// Shrink a little so standing on or sliding along a block doesn't count.
 		CCRect inner{r.origin.x + 1.f, r.origin.y + 1.f, r.size.width - 2.f, r.size.height - 2.f};
 		return inner.intersectsRect(obj->getObjectRect());
 	}
@@ -181,16 +213,16 @@ namespace {
 		return out;
 	}
 
-	bool pathClear(CCRect const& base, Obstacles const& obs, float shift, double dx, double dy) {
+	bool pathClear(CCRect const& base, Obstacles const& obs, double shift, double dx, double dy, double accel) {
 		CCRect start = base;
-		start.origin.y += shift;
+		start.origin.y += static_cast<float>(shift);
 		for (auto obj : obs.solids) {
 			if (insideSolid(start, obj)) return false;
 		}
 		for (int j = 0; j <= kLookahead; ++j) {
 			CCRect r = base;
 			r.origin.x += static_cast<float>(j * dx);
-			r.origin.y += shift + static_cast<float>(j * dy);
+			r.origin.y += static_cast<float>(shift + j * dy + 0.5 * j * (j + 1) * accel);
 			for (auto obj : obs.hazards) {
 				if (hitsHazard(r, obj)) return false;
 			}
@@ -198,61 +230,69 @@ namespace {
 		return true;
 	}
 
-	// Returns true if the death was avoided by shifting the click's timing.
+	// Returns true if the death was avoided by shifting the input's timing.
 	bool tryCorrect(PlayLayer* layer, PlayerObject* player, GameObject* killer) {
 		if (!active() || !player || !killer) return false;
 		if (killer == layer->m_anticheatSpike) return false;
-		if (layer->m_isPlatformer || !player->m_isDart || player->m_isSideways) return false;
+		if (layer->m_isPlatformer || player->m_isSideways) return false;
 
 		auto s = stateFor(layer, player);
 		if (!s) return false;
 
-		// Already moved the wave this tick; GD is still finishing checks against the old spot.
+		// Already moved the player this tick; GD is still finishing checks against the old spot.
 		if (s->correctedStep == g_step) return true;
 		if (s->inputStep < 0 || s->correctedThisInput) return false;
 
 		long long since = g_step - s->inputStep;
 		if (since < 0 || since > kDeathWindow) return false;
 
-		double dyOld = s->dyBeforeInput;
-		double dyNew;
+		bool wave = player->m_isDart;
+		double dyNow;
+		double accelNow = 0.0;
 		if (s->lastMoveStep >= s->inputStep) {
-			dyNew = s->lastDy;
-		} else if (dyOld != 0.0) {
-			dyNew = -dyOld;
+			dyNow = s->lastDy;
+			if (!wave && s->prevMoveStep >= s->inputStep && s->prevMoveStep == s->lastMoveStep - 1) {
+				accelNow = clampAccel(s->lastDy - s->prevDy);
+			}
+		} else if (wave && s->dyBeforeInput != 0.0) {
+			dyNow = -s->dyBeforeInput;
 		} else {
 			return false;
 		}
+
+		// What the y-velocity would be now if the input had never happened.
+		double dyWithoutInput = s->dyBeforeInput + static_cast<double>(since) * s->accelBeforeInput;
+		double delta = dyNow - dyWithoutInput;
 		double dx = s->lastDx;
-		double delta = dyNew - dyOld;
 		if (std::abs(delta) < 0.05 || std::abs(dx) < 0.01) return false;
 
-		int maxTicks = stageTicks();
+		int maxTicks = ticksFor(player);
 		CCRect base = player->getObjectRect();
-		auto obstacles = gatherObstacles(
-			layer,
-			base,
-			static_cast<float>(std::abs(dx) * kLookahead),
-			static_cast<float>(std::abs(delta) * maxTicks + std::abs(dyNew) * kLookahead)
+		float reachY = static_cast<float>(
+			std::min(std::abs(delta) * maxTicks, kMaxShift)
+			+ std::abs(dyNow) * kLookahead
+			+ 0.5 * kLookahead * (kLookahead + 1) * std::abs(accelNow)
 		);
+		auto obstacles = gatherObstacles(layer, base, static_cast<float>(std::abs(dx) * kLookahead), reachY);
 
 		for (int k = 1; k <= maxTicks; ++k) {
 			for (int dir : {1, -1}) {
-				// "Later" can't go past the moment the click actually happened.
+				// "Later" can't go past the moment the input actually happened.
 				if (dir == -1 && k > since) continue;
-				float shift = static_cast<float>(dir * k * delta);
-				if (!pathClear(base, obstacles, shift, dx, dyNew)) continue;
+				double shift = dir * k * delta;
+				if (std::abs(shift) > kMaxShift) continue;
+				if (!pathClear(base, obstacles, shift, dx, dyNow, accelNow)) continue;
 
 				CCPoint pos = player->m_position;
-				pos.y += shift;
+				pos.y += static_cast<float>(shift);
 				player->m_position = pos;
 				player->setPosition(pos);
-				s->prev.y += shift;
+				s->prev.y += static_cast<float>(shift);
 				s->correctedThisInput = true;
 				s->correctedStep = g_step;
 				log::info(
-					"[InputBuffer] Trajectory fix: click treated as {} tick(s) {} (shift {:.2f})",
-					k, dir == 1 ? "earlier" : "later", shift
+					"[InputBuffer] Trajectory fix ({}): input treated as {} tick(s) {} (shift {:.2f})",
+					wave ? "wave" : "other", k, dir == 1 ? "earlier" : "later", shift
 				);
 				return true;
 			}
