@@ -8,7 +8,7 @@
 	},
 	"id": "trenmaxxrr.hacks",
 	"name": "Trenmaxxrr Hacks",
-	"version": "v1.2.0",
+	"version": "v1.3.0",
 	"developer": "Trenmaxxrr",
 	"description": "Custom hacks, each one toggleable in this mod's settings.",
 	"dependencies": {
@@ -24,7 +24,7 @@
 		"input-buffer": {
 			"type": "bool",
 			"name": "Input buffer (F6)",
-			"description": "Lets F6 cycle the input buffer in levels: off, 2, 4, 8, 16 ticks (wave capped at 8). Works in every gamemode except platformer and vertical sections. It starts off every time you open GD, and an on-screen label always shows while it's on.",
+			"description": "Lets F6 cycle the input buffer in levels: off, 2, 4, 8, 16 ticks (wave capped at 8). Works in every gamemode except platformer and vertical sections, and also lets go of a held click early (wave and ship) if holding would crash you. It starts off every time you open GD, and an on-screen label always shows while it's on.",
 			"default": true
 		}
 	}

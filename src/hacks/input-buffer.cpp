@@ -1,13 +1,18 @@
 // Input buffer ("trajectory fix"), all gamemodes.
 //
-// When a player is about to die shortly after a click or release, estimate
-// where they'd be if that input had happened a few ticks earlier or later. If
-// one of those spots is clear of hazards (and stays clear for a few ticks),
-// move the player there instead of dying.
+// When a player is about to die, try two fixes, in order:
 //
-// The estimate: shifting an input by k ticks moves the player by about
-// k * (current y-velocity - the y-velocity they'd have without the input).
-// For the wave that's exact; for gravity modes it's a close first-order guess.
+// 1. Shift the last click/release. If the death comes shortly after an input,
+//    estimate where they'd be if that input had happened a few ticks earlier
+//    or later. Shifting an input by k ticks moves the player by about
+//    k * (current y-velocity - the y-velocity they'd have without the input).
+//    Exact for the wave; a close first-order guess for gravity modes.
+//
+// 2. Early release. If they're holding (wave or ship) and would have survived
+//    by letting go up to a few ticks ago, move them to where that release
+//    would have put them and release the click for them.
+//
+// Either way the new spot must be clear of hazards for a few ticks ahead.
 //
 // F6 (in a level) cycles: OFF -> 2 -> 4 -> 8 -> 16 ticks (wave capped at 8) -> OFF.
 // It starts OFF every session. While it's on, an on-screen label always shows
@@ -43,6 +48,8 @@ namespace {
 
 	int g_stage = 0;
 	long long g_step = 0;
+	// Set while the mod releases a click itself, so that release isn't treated as the player's.
+	bool g_virtualRelease = false;
 
 	struct PlayerState {
 		bool hasPrev = false;
@@ -57,8 +64,21 @@ namespace {
 		double accelBeforeInput = 0;
 		bool correctedThisInput = false;
 		long long correctedStep = -1;
+		bool holding = false;
+		long long holdStartStep = -1;
+		bool autoReleasedThisHold = false;
 	};
 	PlayerState g_states[2];
+
+	// Ship acceleration while holding / not holding, learned from play.
+	// Stored as if gravity were normal; index 0 = normal size, 1 = mini.
+	struct ShipAccel {
+		bool haveHeld = false;
+		bool haveReleased = false;
+		double held = 0;
+		double released = 0;
+	};
+	ShipAccel g_shipAccel[2];
 
 	OBB2D* g_playerBox = nullptr;
 
@@ -83,6 +103,14 @@ namespace {
 		if (player == layer->m_player1) return &g_states[0];
 		if (player == layer->m_player2) return &g_states[1];
 		return nullptr;
+	}
+
+	int sizeIndex(PlayerObject* player) {
+		return player->m_vehicleSize < 1.f ? 1 : 0;
+	}
+
+	double gravitySign(PlayerObject* player) {
+		return player->m_isUpsideDown ? -1.0 : 1.0;
 	}
 
 	std::string stageText() {
@@ -131,13 +159,30 @@ namespace {
 			s.lastDx = pos.x - s.prev.x;
 			s.lastDy = pos.y - s.prev.y;
 			s.lastMoveStep = g_step;
+
+			// Learn the ship's acceleration. Zero means it's at max speed or touching
+			// a floor/ceiling, which says nothing about gravity, so skip it.
+			if (player->m_isShip && s.prevMoveStep == s.lastMoveStep - 1) {
+				double a = s.lastDy - s.prevDy;
+				if (std::abs(a) > 1e-4 && std::abs(a) <= kMaxAccel) {
+					auto& ship = g_shipAccel[sizeIndex(player)];
+					double normalized = a * gravitySign(player);
+					if (s.holding) {
+						ship.held = normalized;
+						ship.haveHeld = true;
+					} else {
+						ship.released = normalized;
+						ship.haveReleased = true;
+					}
+				}
+			}
 		}
 		s.prev = pos;
 		s.hasPrev = true;
 	}
 
-	void noteInput(PlayerObject* player, PlayerButton button) {
-		if (button != PlayerButton::Jump) return;
+	void noteInput(PlayerObject* player, PlayerButton button, bool isPush) {
+		if (button != PlayerButton::Jump || g_virtualRelease) return;
 		auto s = stateFor(PlayLayer::get(), player);
 		if (!s) return;
 		bool haveLast = s->lastMoveStep >= 0 && s->lastMoveStep < g_step;
@@ -147,6 +192,11 @@ namespace {
 		// The wave has no gravity; anything that looks like acceleration is a direction flip.
 		s->accelBeforeInput = (haveAccel && !player->m_isDart) ? clampAccel(s->lastDy - s->prevDy) : 0.0;
 		s->correctedThisInput = false;
+		if (isPush && !s->holding) {
+			s->holdStartStep = g_step;
+			s->autoReleasedThisHold = false;
+		}
+		s->holding = isPush;
 	}
 
 	OBB2D* playerBox(CCRect const& r) {
@@ -230,21 +280,22 @@ namespace {
 		return true;
 	}
 
-	// Returns true if the death was avoided by shifting the input's timing.
-	bool tryCorrect(PlayLayer* layer, PlayerObject* player, GameObject* killer) {
-		if (!active() || !player || !killer) return false;
-		if (killer == layer->m_anticheatSpike) return false;
-		if (layer->m_isPlatformer || player->m_isSideways) return false;
+	void movePlayer(PlayerObject* player, PlayerState* s, double shift) {
+		CCPoint pos = player->m_position;
+		pos.y += static_cast<float>(shift);
+		player->m_position = pos;
+		player->setPosition(pos);
+		s->prev.y += static_cast<float>(shift);
+		s->correctedStep = g_step;
+	}
 
-		auto s = stateFor(layer, player);
-		if (!s) return false;
-
-		// Already moved the player this tick; GD is still finishing checks against the old spot.
-		if (s->correctedStep == g_step) return true;
+	// Fix 1: treat the last click/release as if it happened a few ticks earlier or later.
+	bool shiftLastInput(PlayLayer* layer, PlayerObject* player, PlayerState* s) {
 		if (s->inputStep < 0 || s->correctedThisInput) return false;
 
 		long long since = g_step - s->inputStep;
 		if (since < 0 || since > kDeathWindow) return false;
+		s->correctedThisInput = true;
 
 		bool wave = player->m_isDart;
 		double dyNow;
@@ -283,13 +334,7 @@ namespace {
 				if (std::abs(shift) > kMaxShift) continue;
 				if (!pathClear(base, obstacles, shift, dx, dyNow, accelNow)) continue;
 
-				CCPoint pos = player->m_position;
-				pos.y += static_cast<float>(shift);
-				player->m_position = pos;
-				player->setPosition(pos);
-				s->prev.y += static_cast<float>(shift);
-				s->correctedThisInput = true;
-				s->correctedStep = g_step;
+				movePlayer(player, s, shift);
 				log::info(
 					"[InputBuffer] Trajectory fix ({}): input treated as {} tick(s) {} (shift {:.2f})",
 					wave ? "wave" : "other", k, dir == 1 ? "earlier" : "later", shift
@@ -297,8 +342,97 @@ namespace {
 				return true;
 			}
 		}
+		return false;
+	}
 
-		s->correctedThisInput = true;
+	// Fix 2: the player held too long; release for them as if they'd let go a few ticks ago.
+	bool releaseEarly(PlayLayer* layer, PlayerObject* player, PlayerState* s) {
+		if (!s->holding || s->autoReleasedThisHold) return false;
+		bool wave = player->m_isDart;
+		bool ship = player->m_isShip;
+		if (!wave && !ship) return false;
+		if (s->lastMoveStep < 0) return false;
+		s->autoReleasedThisHold = true;
+
+		double dx = s->lastDx;
+		double dyNow = s->lastDy;
+		if (std::abs(dx) < 0.01) return false;
+
+		// Can't release before the click started.
+		long long heldFor = s->holdStartStep >= 0 ? g_step - s->holdStartStep : kDeathWindow;
+		int maxTicks = static_cast<int>(std::min<long long>(ticksFor(player), heldFor));
+		if (maxTicks < 1) return false;
+
+		// Per-tick effect of having released one tick earlier, and the motion right after release.
+		double dyAfter;
+		double accelAfter;
+		double accelDiff = 0.0;
+		if (wave) {
+			if (std::abs(dyNow) < 0.05) return false;
+			dyAfter = -dyNow;
+			accelAfter = 0.0;
+		} else {
+			auto const& learned = g_shipAccel[sizeIndex(player)];
+			if (!learned.haveHeld || !learned.haveReleased) return false;
+			double sign = gravitySign(player);
+			accelDiff = (learned.released - learned.held) * sign;
+			dyAfter = dyNow;
+			accelAfter = learned.released * sign;
+		}
+
+		auto shiftFor = [&](int k) {
+			// Wave: k ticks going the other way. Ship: k ticks of different acceleration.
+			return wave ? -2.0 * k * dyNow : 0.5 * k * (k + 1) * accelDiff;
+		};
+
+		CCRect base = player->getObjectRect();
+		float reachY = static_cast<float>(
+			std::min(std::abs(shiftFor(maxTicks)), kMaxShift)
+			+ std::abs(dyAfter) * kLookahead
+			+ 0.5 * kLookahead * (kLookahead + 1) * std::abs(accelAfter)
+		);
+		auto obstacles = gatherObstacles(layer, base, static_cast<float>(std::abs(dx) * kLookahead), reachY);
+
+		for (int k = 1; k <= maxTicks; ++k) {
+			double shift = shiftFor(k);
+			if (std::abs(shift) < 0.01 || std::abs(shift) > kMaxShift) continue;
+			if (!pathClear(base, obstacles, shift, dx, dyAfter, accelAfter)) continue;
+
+			movePlayer(player, s, shift);
+
+			g_virtualRelease = true;
+			player->releaseButton(PlayerButton::Jump);
+			g_virtualRelease = false;
+
+			s->holding = false;
+			s->inputStep = g_step;
+			s->dyBeforeInput = dyNow;
+			s->accelBeforeInput = 0.0;
+			s->correctedThisInput = true;
+
+			log::info(
+				"[InputBuffer] Early release ({}): released {} tick(s) early (shift {:.2f})",
+				wave ? "wave" : "ship", k, shift
+			);
+			return true;
+		}
+		return false;
+	}
+
+	// Returns true if the death was avoided.
+	bool tryCorrect(PlayLayer* layer, PlayerObject* player, GameObject* killer) {
+		if (!active() || !player || !killer) return false;
+		if (killer == layer->m_anticheatSpike) return false;
+		if (layer->m_isPlatformer || player->m_isSideways) return false;
+
+		auto s = stateFor(layer, player);
+		if (!s) return false;
+
+		// Already moved the player this tick; GD is still finishing checks against the old spot.
+		if (s->correctedStep == g_step) return true;
+
+		if (shiftLastInput(layer, player, s)) return true;
+		if (releaseEarly(layer, player, s)) return true;
 		return false;
 	}
 }
@@ -341,12 +475,12 @@ class $modify(BufferGameLayer, GJBaseGameLayer) {
 
 class $modify(BufferPlayer, PlayerObject) {
 	bool pushButton(PlayerButton button) {
-		noteInput(this, button);
+		noteInput(this, button, true);
 		return PlayerObject::pushButton(button);
 	}
 
 	bool releaseButton(PlayerButton button) {
-		noteInput(this, button);
+		noteInput(this, button, false);
 		return PlayerObject::releaseButton(button);
 	}
 };

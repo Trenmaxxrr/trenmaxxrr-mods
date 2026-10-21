@@ -1,3 +1,6 @@
+# v1.3.0
+- Early release: on wave and ship, if holding would crash you and letting go a few ticks earlier wouldn't have, the click is released for you. Ship learns its physics from your play, so it starts working after you've let go in a ship once that session (normal and mini are learned separately).
+
 # v1.2.0
 - Input buffer now works in every gamemode (not platformer or vertical sections). Stage 4 is 16 ticks for everything and 8 for the wave, same as the original.
 
