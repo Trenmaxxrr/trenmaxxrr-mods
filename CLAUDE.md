@@ -20,4 +20,5 @@ Geode mod for Geometry Dash. The owner sends a YouTube video of a hack and wants
 ## Build
 - Claude can't compile locally. Pushing to any branch triggers `.github/workflows/build.yml`, which builds a Windows `.geode` file and uploads it as the `trenmaxxrr-hacks-windows` artifact.
 - After pushing, check the run result. If it fails, read the log, fix the error, and push again before telling the owner it's ready.
+- The full job log isn't reachable from this environment. Compile and link errors show up as annotations instead: `gh api repos/Trenmaxxrr/trenmaxxrr-mods/check-runs/<job id>/annotations` (job id from `.../actions/runs/<run id>/jobs`).
 - The owner installs the build by dropping the `.geode` file into `geode/mods` and restarting GD, then reports back. Claude can't run GD, so the owner is the tester.

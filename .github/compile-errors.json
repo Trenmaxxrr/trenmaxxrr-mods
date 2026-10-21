@@ -1,0 +1,28 @@
+{
+	"problemMatcher": [
+		{
+			"owner": "clang-error",
+			"severity": "error",
+			"pattern": [
+				{
+					"regexp": "^(.+?):(\\d+):(\\d+):\\s+(?:fatal )?error:\\s+(.*)$",
+					"file": 1,
+					"line": 2,
+					"column": 3,
+					"message": 4
+				}
+			]
+		},
+		{
+			"owner": "link-error",
+			"severity": "error",
+			"pattern": [
+				{
+					"regexp": "^((?:lld-link|ld\\.lld|clang\\+\\+|clang)(?:\\.exe)?):\\s+error:\\s+(.*)$",
+					"file": 1,
+					"message": 2
+				}
+			]
+		}
+	]
+}

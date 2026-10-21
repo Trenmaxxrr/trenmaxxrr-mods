@@ -14,6 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Turns compiler/linker errors into annotations, readable from the API without the full log.
+      - name: Report compile errors as annotations
+        shell: bash
+        run: echo "::add-matcher::.github/compile-errors.json"
+
       - name: Build the mod
         id: build
         uses: geode-sdk/build-geode-mod@main
